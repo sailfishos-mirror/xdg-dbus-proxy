@@ -33,6 +33,7 @@
 #define DBUS_SERVICE_DBUS "org.freedesktop.DBus"
 #define DBUS_PATH_DBUS "/org/freedesktop/DBus"
 #define DBUS_INTERFACE_DBUS "org.freedesktop.DBus"
+#define DBUS_INTERFACE_PEER "org.freedesktop.DBus.Peer"
 
 #define DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER 1
 #define DBUS_REQUEST_NAME_REPLY_IN_QUEUE 2
@@ -367,6 +368,7 @@ fixture_start_proxy (Fixture *f)
 {
   g_autoptr(GSubprocessLauncher) launcher = NULL;
   g_autoptr(GError) error = NULL;
+  g_autoptr(GVariant) tuple = NULL;
   int sync_pipe[PIPE_FDS];
   char buf;
   ssize_t bytes_read;
@@ -416,6 +418,18 @@ fixture_start_proxy (Fixture *f)
   g_assert_no_error (error);
   g_assert_nonnull (f->proxied.conn);
   f->proxied.unique_name = g_dbus_connection_get_unique_name (f->proxied.conn);
+  tuple = g_dbus_connection_call_sync (f->proxied.conn,
+                                       DBUS_SERVICE_DBUS,
+                                       DBUS_PATH_DBUS,
+                                       DBUS_INTERFACE_DBUS,
+                                       "AddMatch",
+                                       g_variant_new ("(s)", ""),
+                                       G_VARIANT_TYPE ("()"),
+                                       G_DBUS_CALL_FLAGS_NONE,
+                                       -1,
+                                       NULL,    /* cancellable */
+                                       &error);
+  g_assert_no_error (error);
   f->proxied.filter = g_dbus_connection_add_filter (f->proxied.conn,
                                                     conn_filter_cb,
                                                     &f->proxied,
@@ -687,6 +701,129 @@ test_own (Fixture *f,
     }
 }
 
+typedef struct
+{
+  const char *name;
+  const char *path;
+  const char *iface;
+  const char *member;
+  gboolean can_receive_broadcast;
+} ReceiveTest;
+
+static const ReceiveTest receive_tests[] =
+{
+  { CANNOT_ACCESS_NAME, EXAMPLE_PATH, EXAMPLE_IFACE, EXAMPLE_SIGNAL, FALSE },
+  { CAN_SEE_NAME, EXAMPLE_PATH, EXAMPLE_IFACE, EXAMPLE_SIGNAL, FALSE },
+  { CAN_TALK_NAME, EXAMPLE_PATH, EXAMPLE_IFACE, EXAMPLE_SIGNAL, TRUE },
+  { CAN_OWN_NAME, EXAMPLE_PATH, EXAMPLE_IFACE, EXAMPLE_SIGNAL, TRUE },
+
+  /* Before GHSA-r7hp-698j-2h6c was fixed, both of these would receive the
+   * broadcast, but that was unintended */
+  { CAN_CALL_ANYTHING_NAME, EXAMPLE_PATH, EXAMPLE_IFACE, EXAMPLE_SIGNAL, FALSE },
+  { CAN_CALL_SOME_NAME, EXAMPLE_PATH, EXAMPLE_IFACE, EXAMPLE_SIGNAL, FALSE },
+
+  { CAN_RECEIVE_ANYTHING_NAME, EXAMPLE_PATH, EXAMPLE_IFACE, EXAMPLE_SIGNAL, TRUE },
+
+  { CAN_RECEIVE_SOME_NAME, CAN_RECEIVE_SOME_PATH, CAN_RECEIVE_SOME_IFACE, CAN_RECEIVE_SOME_SIGNAL, TRUE },
+
+  /* Before GHSA-r7hp-698j-2h6c was fixed, all of these would receive the broadcast,
+   * but that was unintended */
+  { CAN_RECEIVE_SOME_NAME, EXAMPLE_PATH, CAN_RECEIVE_SOME_IFACE, CAN_RECEIVE_SOME_SIGNAL, FALSE },
+  { CAN_RECEIVE_SOME_NAME, CAN_RECEIVE_SOME_PATH, EXAMPLE_IFACE, CAN_RECEIVE_SOME_SIGNAL, FALSE },
+  { CAN_RECEIVE_SOME_NAME, CAN_RECEIVE_SOME_PATH, CAN_RECEIVE_SOME_IFACE, EXAMPLE_SIGNAL, FALSE },
+  { CAN_RECEIVE_SOME_NAME, EXAMPLE_PATH, EXAMPLE_IFACE, EXAMPLE_SIGNAL, FALSE },
+};
+
+static void
+test_receive (Fixture *f,
+              gconstpointer context G_GNUC_UNUSED)
+{
+  alarm (30);
+  fixture_start_proxy (f);
+
+  for (size_t i = 0; i < G_N_ELEMENTS (receive_tests); i++)
+    {
+      g_autoptr(GAsyncResult) result = NULL;
+      g_autoptr(GVariant) tuple = NULL;
+      g_autoptr(GError) error = NULL;
+      const Connection *sender;
+      const ReceiveTest *t = &receive_tests[i];
+      int n_unicasts_before;
+      int n_broadcasts_before;
+      int n_calls_before;
+
+      g_test_message ("#%zu: sandboxed connection %s be allowed to receive broadcast from %s:%s.%s on %s",
+                      i,
+                      t->can_receive_broadcast ? "should" : "should not",
+                      t->path,
+                      t->iface,
+                      t->member,
+                      t->name);
+
+      sender = g_hash_table_lookup (f->connections_by_name, t->name);
+      g_assert_nonnull (sender);
+
+      n_calls_before = g_atomic_int_get (&f->proxied.n_method_calls);
+      n_unicasts_before = g_atomic_int_get (&f->proxied.n_unicast_signals);
+      n_broadcasts_before = g_atomic_int_get (&f->proxied.n_broadcasts);
+
+      /* The sandboxed recipient is only sometimes allowed to receive
+       * broadcasts. We do this first, because D-Bus preserves message
+       * order, therefore by the time we have received the unicast signal
+       * and/or the method call, it's guaranteed that this broadcast
+       * has been processed (and received, or not, as appropriate). */
+      g_dbus_connection_emit_signal (sender->conn,
+                                     NULL,
+                                     t->path,
+                                     t->iface,
+                                     t->member,
+                                     NULL,
+                                     &error);
+      g_assert_no_error (error);
+
+      /* The sandboxed recipient is always allowed to receive
+       * unicast signals. */
+      g_dbus_connection_emit_signal (sender->conn,
+                                     f->proxied.unique_name,
+                                     t->path,
+                                     t->iface,
+                                     t->member,
+                                     NULL,
+                                     &error);
+      g_assert_no_error (error);
+
+      /* The sandboxed recipient is always allowed to receive
+       * method calls. */
+      g_dbus_connection_call (sender->conn,
+                              f->proxied.unique_name,
+                              "/",
+                              DBUS_INTERFACE_PEER,
+                              "Ping",
+                              NULL,
+                              G_VARIANT_TYPE ("()"),
+                              G_DBUS_CALL_FLAGS_NONE,
+                              -1,
+                              NULL,    /* cancellable */
+                              ready_cb,
+                              &result);
+
+      while (result == NULL)
+        g_main_context_iteration (NULL, TRUE);
+
+      tuple = g_dbus_connection_call_finish (sender->conn, result, &error);
+      g_assert_no_error (error);
+      g_assert_nonnull (tuple);
+
+      g_assert_cmpint (g_atomic_int_get (&f->proxied.n_method_calls), ==, n_calls_before + 1);
+      g_assert_cmpint (g_atomic_int_get (&f->proxied.n_unicast_signals), ==, n_unicasts_before + 1);
+
+      if (t->can_receive_broadcast)
+        g_assert_cmpint (g_atomic_int_get (&f->proxied.n_broadcasts), ==, n_broadcasts_before + 1);
+      else
+        g_assert_cmpint (g_atomic_int_get (&f->proxied.n_broadcasts), ==, n_broadcasts_before);
+    }
+}
+
 static void
 teardown (Fixture *f,
           gconstpointer context G_GNUC_UNUSED)
@@ -757,6 +894,7 @@ main (int argc,
   g_test_add ("/basics", Fixture, NULL, setup, test_basics, teardown);
   g_test_add ("/call", Fixture, NULL, setup, test_call, teardown);
   g_test_add ("/own", Fixture, NULL, setup, test_own, teardown);
+  g_test_add ("/receive", Fixture, NULL, setup, test_receive, teardown);
 
   return g_test_run ();
 }
