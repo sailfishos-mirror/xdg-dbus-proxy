@@ -142,7 +142,8 @@ test_basics (Fixture *f,
   g_assert_no_error (error);
   f->sync_pipe = sync_pipe[READ_END];
 
-  launcher = g_subprocess_launcher_new (G_SUBPROCESS_FLAGS_STDOUT_PIPE);
+  launcher = g_subprocess_launcher_new (G_SUBPROCESS_FLAGS_NONE);
+  g_subprocess_launcher_take_fd (launcher, dup (STDERR_FILENO), STDOUT_FILENO);
   g_subprocess_launcher_take_fd (launcher, sync_pipe[WRITE_END], 3);
   sync_pipe[WRITE_END] = -1;
 
