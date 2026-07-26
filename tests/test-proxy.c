@@ -59,6 +59,18 @@
 #define CAN_RECEIVE_SOME_SIGNAL "JustThisSignal"
 #define CAN_RECEIVE_SOME_PATH "/just/this/path"
 
+static void
+ready_cb (GObject *source_object,
+          GAsyncResult *result,
+          void *user_data)
+{
+  GAsyncResult **result_p = user_data;
+
+  g_assert_nonnull (result_p);
+  g_assert_null (*result_p);
+  *result_p = g_object_ref (result);
+}
+
 typedef struct
 {
   GDBusConnection *conn;
@@ -451,6 +463,130 @@ test_basics (Fixture *f,
 typedef struct
 {
   const char *name;
+  const char *path;
+  const char *iface;
+  const char *method;
+  gboolean can_call;
+  gboolean can_see;
+} CallTest;
+
+static const CallTest call_tests[] =
+{
+  { CANNOT_ACCESS_NAME, EXAMPLE_PATH, EXAMPLE_IFACE, EXAMPLE_METHOD,
+    .can_call = FALSE, .can_see = FALSE },
+  { CAN_SEE_NAME, EXAMPLE_PATH, EXAMPLE_IFACE, EXAMPLE_METHOD,
+    .can_call = FALSE, .can_see = TRUE },
+  { CAN_TALK_NAME, EXAMPLE_PATH, EXAMPLE_IFACE, EXAMPLE_METHOD,
+    .can_call = TRUE, .can_see = TRUE },
+  { CAN_OWN_NAME, EXAMPLE_PATH, EXAMPLE_IFACE, EXAMPLE_METHOD,
+    .can_call = TRUE, .can_see = TRUE },
+  { CAN_RECEIVE_ANYTHING_NAME, EXAMPLE_PATH, EXAMPLE_IFACE, EXAMPLE_METHOD,
+    .can_call = FALSE, .can_see = TRUE },
+  { CAN_RECEIVE_SOME_NAME, EXAMPLE_PATH, EXAMPLE_IFACE, EXAMPLE_METHOD,
+    .can_call = FALSE, .can_see = TRUE },
+
+  { CAN_CALL_ANYTHING_NAME, EXAMPLE_PATH, EXAMPLE_IFACE, EXAMPLE_METHOD,
+    .can_call = TRUE, .can_see = TRUE },
+
+  { CAN_CALL_SOME_NAME, EXAMPLE_PATH, EXAMPLE_IFACE, EXAMPLE_METHOD,
+    .can_call = FALSE, .can_see = TRUE },
+  { CAN_CALL_SOME_NAME, CAN_CALL_SOME_PATH, CAN_CALL_SOME_IFACE, CAN_CALL_SOME_METHOD,
+    .can_call = TRUE, .can_see = TRUE },
+  { CAN_CALL_SOME_NAME, EXAMPLE_PATH, CAN_CALL_SOME_IFACE, CAN_CALL_SOME_METHOD,
+    .can_call = FALSE, .can_see = TRUE },
+  { CAN_CALL_SOME_NAME, CAN_CALL_SOME_PATH, EXAMPLE_IFACE, CAN_CALL_SOME_METHOD,
+    .can_call = FALSE, .can_see = TRUE },
+  { CAN_CALL_SOME_NAME, CAN_CALL_SOME_PATH, CAN_CALL_SOME_IFACE, EXAMPLE_METHOD,
+    .can_call = FALSE, .can_see = TRUE },
+};
+
+static void
+test_call (Fixture *f,
+           gconstpointer context G_GNUC_UNUSED)
+{
+  alarm (30);
+  fixture_start_proxy (f);
+
+  for (size_t i = 0; i < G_N_ELEMENTS (call_tests); i++)
+    {
+      const CallTest *t = &call_tests[i];
+      g_autoptr(GAsyncResult) result = NULL;
+      g_autoptr(GError) error = NULL;
+      g_autoptr(GVariant) tuple = NULL;
+      const Connection *dest;
+      int n_calls_before;
+
+      g_test_message ("#%zu: sandboxed connection %s be allowed to call %s:%s.%s on %s",
+                      i,
+                      t->can_call ? "should" : "should not",
+                      t->path,
+                      t->iface,
+                      t->method,
+                      t->name);
+
+      dest = g_hash_table_lookup (f->connections_by_name, t->name);
+      g_assert_nonnull (dest);
+      n_calls_before = g_atomic_int_get (&dest->n_method_calls);
+
+      g_dbus_connection_call (f->proxied.conn,
+                              t->name,
+                              t->path,
+                              t->iface,
+                              t->method,
+                              NULL,
+                              G_VARIANT_TYPE ("()"),
+                              G_DBUS_CALL_FLAGS_NONE,
+                              -1,
+                              NULL,    /* cancellable */
+                              ready_cb,
+                              &result);
+
+      while (result == NULL)
+        g_main_context_iteration (NULL, TRUE);
+
+      tuple = g_dbus_connection_call_finish (f->proxied.conn, result, &error);
+      g_assert_nonnull (error);
+      g_assert_null (tuple);
+      g_test_message ("-> %s", error->message);
+
+      if (t->can_call)
+        {
+          /* If the method call was allowed, we just return an error,
+           * because for simplicity we didn't actually implement any
+           * method calls. */
+          g_assert_cmpstr (g_quark_to_string (error->domain),
+                           ==, g_quark_to_string (G_DBUS_ERROR));
+
+          switch (error->code)
+            {
+              case G_DBUS_ERROR_UNKNOWN_METHOD:
+              case G_DBUS_ERROR_UNKNOWN_INTERFACE:
+              case G_DBUS_ERROR_UNKNOWN_OBJECT:
+                /* OK */
+                break;
+
+              default:
+                g_assert_not_reached ();
+            }
+
+          g_assert_cmpint (g_atomic_int_get (&dest->n_method_calls), ==, n_calls_before + 1);
+        }
+      else if (t->can_see)
+        {
+          g_assert_error (error, G_DBUS_ERROR, G_DBUS_ERROR_ACCESS_DENIED);
+          g_assert_cmpint (g_atomic_int_get (&dest->n_method_calls), ==, n_calls_before);
+        }
+      else
+        {
+          g_assert_error (error, G_DBUS_ERROR, G_DBUS_ERROR_SERVICE_UNKNOWN);
+          g_assert_cmpint (g_atomic_int_get (&dest->n_method_calls), ==, n_calls_before);
+        }
+    }
+}
+
+typedef struct
+{
+  const char *name;
   gboolean can_own;
   gboolean can_see;
 } OwnTest;
@@ -619,6 +755,7 @@ main (int argc,
   g_test_init (&argc, &argv, NULL);
 
   g_test_add ("/basics", Fixture, NULL, setup, test_basics, teardown);
+  g_test_add ("/call", Fixture, NULL, setup, test_call, teardown);
   g_test_add ("/own", Fixture, NULL, setup, test_own, teardown);
 
   return g_test_run ();
