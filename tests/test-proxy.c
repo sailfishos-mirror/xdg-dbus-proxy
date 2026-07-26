@@ -36,7 +36,30 @@
 
 typedef struct
 {
-  GDBusConnection *proxied_conn;
+  GDBusConnection *conn;
+  const char *unique_name;
+} Connection;
+
+static void
+connection_clear (Connection *self)
+{
+  if (self->conn != NULL)
+    {
+      g_autoptr(GError) error = NULL;
+
+      g_dbus_connection_close_sync (self->conn, NULL, &error);
+
+      if (error != NULL)
+        g_assert_error (error, G_IO_ERROR, G_IO_ERROR_CLOSED);
+    }
+
+  self->unique_name = NULL;
+  g_clear_object (&self->conn);
+}
+
+typedef struct
+{
+  Connection proxied;
   GSubprocess *dbus_daemon;
   GSubprocess *monitor;
   GSubprocess *proxy;
@@ -135,21 +158,13 @@ enum
 };
 
 static void
-test_basics (Fixture *f,
-             gconstpointer context G_GNUC_UNUSED)
+fixture_start_proxy (Fixture *f)
 {
   g_autoptr(GSubprocessLauncher) launcher = NULL;
   g_autoptr(GError) error = NULL;
-  g_autoptr(GVariant) tuple = NULL;
-  g_auto(GStrv) strv = NULL;
-  const char *proxied_name;
   int sync_pipe[PIPE_FDS];
   char buf;
   ssize_t bytes_read;
-  gsize i;
-  gboolean found;
-
-  alarm (30);
 
 #if GLIB_CHECK_VERSION (2, 78, 0)
   g_unix_open_pipe (sync_pipe, O_CLOEXEC, &error);
@@ -177,15 +192,32 @@ test_basics (Fixture *f,
   bytes_read = read (sync_pipe[READ_END], &buf, 1);
   g_assert_cmpint (bytes_read, ==, 1);
 
-  f->proxied_conn = g_dbus_connection_new_for_address_sync (f->proxy_address,
-                                                            G_DBUS_CONNECTION_FLAGS_AUTHENTICATION_CLIENT
-                                                            | G_DBUS_CONNECTION_FLAGS_MESSAGE_BUS_CONNECTION,
-                                                            NULL, NULL, &error);
+  f->proxied.conn = g_dbus_connection_new_for_address_sync (f->proxy_address,
+                                                            (G_DBUS_CONNECTION_FLAGS_AUTHENTICATION_CLIENT
+                                                             | G_DBUS_CONNECTION_FLAGS_MESSAGE_BUS_CONNECTION),
+                                                            NULL,    /* observer */
+                                                            NULL,    /* cancellable */
+                                                            &error);
   g_assert_no_error (error);
-  g_assert_nonnull (f->proxied_conn);
-  proxied_name = g_dbus_connection_get_unique_name (f->proxied_conn);
+  g_assert_nonnull (f->proxied.conn);
+  f->proxied.unique_name = g_dbus_connection_get_unique_name (f->proxied.conn);
+}
 
-  tuple = g_dbus_connection_call_sync (f->proxied_conn, DBUS_SERVICE_DBUS,
+static void
+test_basics (Fixture *f,
+             gconstpointer context G_GNUC_UNUSED)
+{
+  g_autoptr(GError) error = NULL;
+  g_autoptr(GVariant) tuple = NULL;
+  g_auto(GStrv) strv = NULL;
+  gsize i;
+  gboolean found;
+
+  alarm (30);
+
+  fixture_start_proxy (f);
+
+  tuple = g_dbus_connection_call_sync (f->proxied.conn, DBUS_SERVICE_DBUS,
                                        DBUS_PATH_DBUS, DBUS_INTERFACE_DBUS,
                                        "ListNames", NULL,
                                        G_VARIANT_TYPE ("(as)"),
@@ -202,7 +234,7 @@ test_basics (Fixture *f,
     {
       g_test_message ("ListNames(): %s", strv[i]);
 
-      if (g_strcmp0 (strv[i], proxied_name) == 0)
+      if (g_strcmp0 (strv[i], f->proxied.unique_name) == 0)
         found = TRUE;
     }
 
@@ -243,16 +275,7 @@ teardown (Fixture *f,
       g_assert_no_error (error);
     }
 
-  if (f->proxied_conn != NULL)
-    {
-      g_dbus_connection_close_sync (f->proxied_conn, NULL, &error);
-
-      if (error != NULL)
-        {
-          g_assert_error (error, G_IO_ERROR, G_IO_ERROR_CLOSED);
-          g_clear_error (&error);
-        }
-    }
+  connection_clear (&f->proxied);
 
   if (f->proxy_socket != NULL)
     {
@@ -271,7 +294,6 @@ teardown (Fixture *f,
     }
 
   g_clear_object (&f->monitor);
-  g_clear_object (&f->proxied_conn);
   g_clear_object (&f->dbus_daemon);
   g_clear_object (&f->proxy);
   g_free (f->dbus_address);
