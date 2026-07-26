@@ -38,6 +38,7 @@ typedef struct
 {
   GDBusConnection *proxied_conn;
   GSubprocess *dbus_daemon;
+  GSubprocess *monitor;
   GSubprocess *proxy;
   gchar *dbus_address;
   gchar *temp_directory;
@@ -101,6 +102,18 @@ setup (Fixture *f,
   g_assert_nonnull (newline);
   *newline = '\0';
   f->dbus_address = g_strdup (address_buffer);
+
+  if (g_getenv ("TEST_DBUS_MONITOR") != NULL)
+    {
+      g_autoptr(GSubprocessLauncher) monitor_launcher = NULL;
+
+      monitor_launcher = g_subprocess_launcher_new (G_SUBPROCESS_FLAGS_NONE);
+      g_subprocess_launcher_take_stdout_fd (monitor_launcher, dup (STDERR_FILENO));
+      f->monitor = g_subprocess_launcher_spawn (monitor_launcher, NULL,
+                                                "dbus-monitor",
+                                                "--address", f->dbus_address,
+                                                NULL);
+    }
 
   f->proxy_path = g_getenv ("DBUS_PROXY");
 
@@ -202,6 +215,13 @@ teardown (Fixture *f,
 {
   g_autoptr(GError) error = NULL;
 
+  if (f->monitor != NULL)
+    {
+      g_subprocess_send_signal (f->monitor, SIGTERM);
+      g_subprocess_wait (f->monitor, NULL, &error);
+      g_assert_no_error (error);
+    }
+
   if (f->dbus_daemon != NULL)
     {
       g_subprocess_send_signal (f->dbus_daemon, SIGTERM);
@@ -250,6 +270,7 @@ teardown (Fixture *f,
       g_free (f->temp_directory);
     }
 
+  g_clear_object (&f->monitor);
   g_clear_object (&f->proxied_conn);
   g_clear_object (&f->dbus_daemon);
   g_clear_object (&f->proxy);
