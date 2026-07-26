@@ -138,7 +138,11 @@ test_basics (Fixture *f,
 
   alarm (30);
 
+#if GLIB_CHECK_VERSION (2, 78, 0)
+  g_unix_open_pipe (sync_pipe, O_CLOEXEC, &error);
+#else
   g_unix_open_pipe (sync_pipe, FD_CLOEXEC, &error);
+#endif
   g_assert_no_error (error);
   f->sync_pipe = sync_pipe[READ_END];
 
