@@ -62,7 +62,12 @@
 typedef struct
 {
   GDBusConnection *conn;
+  const char *label;
   const char *unique_name;
+  guint filter;
+  int n_method_calls;       /* atomic */
+  int n_unicast_signals;    /* atomic */
+  int n_broadcasts;         /* atomic */
 } Connection;
 
 static void
@@ -71,6 +76,12 @@ connection_clear (Connection *self)
   if (self->conn != NULL)
     {
       g_autoptr(GError) error = NULL;
+
+      if (self->filter != 0)
+        {
+          g_dbus_connection_remove_filter (self->conn, self->filter);
+          self->filter = 0;
+        }
 
       g_dbus_connection_close_sync (self->conn, NULL, &error);
 
@@ -93,6 +104,7 @@ typedef struct
   Connection can_call_some_conn;
   Connection can_receive_anything_conn;
   Connection can_receive_some_conn;
+  GHashTable *connections_by_name;
   GSubprocess *dbus_daemon;
   GSubprocess *monitor;
   GSubprocess *proxy;
@@ -109,6 +121,76 @@ typedef struct
   int dummy;
 } Config;
 
+static GDBusMessage *
+conn_filter_cb (GDBusConnection *conn,
+                GDBusMessage *message,
+                gboolean incoming,
+                void *user_data)
+{
+  Connection *conn_info = user_data;
+
+  g_assert (conn == conn_info->conn);
+
+  if (incoming)
+    {
+      GDBusMessageType type = g_dbus_message_get_message_type (message);
+      const char *sender = g_dbus_message_get_sender (message);
+      const char *dest = g_dbus_message_get_destination (message);
+      const char *path = g_dbus_message_get_path (message);
+      const char *iface = g_dbus_message_get_interface (message);
+      const char *member = g_dbus_message_get_member (message);
+
+      g_test_message ("%s got message type %u, from=%s, to=%s, path=%s, %s.%s",
+                      conn_info->label,
+                      type,
+                      sender ?: "(message bus)",
+                      dest ?: "(broadcast)",
+                      path ?: "(none)",
+                      iface ?: "(none)",
+                      member ?: "(none)");
+
+      switch (type)
+        {
+          case G_DBUS_MESSAGE_TYPE_METHOD_CALL:
+            g_test_message ("%s got method call", conn_info->label);
+            g_atomic_int_inc (&conn_info->n_method_calls);
+            break;
+
+          case G_DBUS_MESSAGE_TYPE_SIGNAL:
+            if (sender == NULL)
+              {
+                g_test_message ("%s got signal from message bus, ignoring", conn_info->label);
+              }
+            else if (dest != NULL && dest[0] != '\0')
+              {
+                g_test_message ("%s got unicast signal", conn_info->label);
+                g_atomic_int_inc (&conn_info->n_unicast_signals);
+              }
+            else
+              {
+                g_test_message ("%s got broadcast signal", conn_info->label);
+                g_atomic_int_inc (&conn_info->n_broadcasts);
+              }
+
+            break;
+
+          case G_DBUS_MESSAGE_TYPE_METHOD_RETURN:
+            g_test_message ("%s got method reply", conn_info->label);
+            break;
+
+          case G_DBUS_MESSAGE_TYPE_ERROR:
+            g_test_message ("%s got error reply", conn_info->label);
+            break;
+
+          case G_DBUS_MESSAGE_TYPE_INVALID:
+          default:
+            g_assert_not_reached ();
+        }
+    }
+
+  return message;
+}
+
 /*
  * Open a direct connection to the bus
  */
@@ -121,6 +203,12 @@ fixture_connect (Fixture *f,
 
   g_return_if_fail (conn != NULL);
   g_return_if_fail (conn->conn == NULL);
+
+  if (name != NULL)
+    conn->label = name;
+  else
+    conn->label = "(unnamed connection)";
+
   conn->conn = g_dbus_connection_new_for_address_sync (f->dbus_address,
                                                        (G_DBUS_CONNECTION_FLAGS_AUTHENTICATION_CLIENT
                                                         | G_DBUS_CONNECTION_FLAGS_MESSAGE_BUS_CONNECTION),
@@ -155,7 +243,16 @@ fixture_connect (Fixture *f,
       g_assert_nonnull (tuple);
       g_variant_get (tuple, "(u)", &result);
       g_assert_cmpuint (result, ==, DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER);
+
+      g_hash_table_replace (f->connections_by_name,
+                            g_strdup (name),
+                            conn);
     }
+
+  conn->filter = g_dbus_connection_add_filter (conn->conn,
+                                               conn_filter_cb,
+                                               conn,
+                                               NULL);
 }
 
 static void
@@ -231,6 +328,11 @@ setup (Fixture *f,
   escaped = g_dbus_address_escape_value (f->proxy_socket);
   f->proxy_address = g_strdup_printf ("unix:path=%s", escaped);
 
+  f->connections_by_name = g_hash_table_new_full (g_str_hash,
+                                                  g_str_equal,
+                                                  g_free,
+                                                  NULL);
+
   fixture_connect (f, &f->cannot_access_conn, CANNOT_ACCESS_NAME);
   fixture_connect (f, &f->can_see_conn, CAN_SEE_NAME);
   fixture_connect (f, &f->can_talk_conn, CAN_TALK_NAME);
@@ -292,6 +394,7 @@ fixture_start_proxy (Fixture *f)
   bytes_read = read (sync_pipe[READ_END], &buf, 1);
   g_assert_cmpint (bytes_read, ==, 1);
 
+  f->proxied.label = "Sandboxed connection";
   f->proxied.conn = g_dbus_connection_new_for_address_sync (f->proxy_address,
                                                             (G_DBUS_CONNECTION_FLAGS_AUTHENTICATION_CLIENT
                                                              | G_DBUS_CONNECTION_FLAGS_MESSAGE_BUS_CONNECTION),
@@ -301,6 +404,10 @@ fixture_start_proxy (Fixture *f)
   g_assert_no_error (error);
   g_assert_nonnull (f->proxied.conn);
   f->proxied.unique_name = g_dbus_connection_get_unique_name (f->proxied.conn);
+  f->proxied.filter = g_dbus_connection_add_filter (f->proxied.conn,
+                                                    conn_filter_cb,
+                                                    &f->proxied,
+                                                    NULL);
 }
 
 static void
@@ -496,6 +603,7 @@ teardown (Fixture *f,
       g_free (f->temp_directory);
     }
 
+  g_clear_pointer (&f->connections_by_name, g_hash_table_unref);
   g_clear_object (&f->monitor);
   g_clear_object (&f->dbus_daemon);
   g_clear_object (&f->proxy);
