@@ -34,6 +34,31 @@
 #define DBUS_PATH_DBUS "/org/freedesktop/DBus"
 #define DBUS_INTERFACE_DBUS "org.freedesktop.DBus"
 
+#define DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER 1
+#define DBUS_REQUEST_NAME_REPLY_IN_QUEUE 2
+#define DBUS_REQUEST_NAME_REPLY_EXISTS 3
+#define DBUS_REQUEST_NAME_REPLY_ALREADY_OWNER 4
+
+#define CANNOT_ACCESS_NAME "com.example.CannotAccess"
+#define CAN_SEE_NAME "com.example.CanSee"
+#define CAN_TALK_NAME "com.example.CanTalk"
+#define CAN_OWN_NAME "com.example.CanOwn"
+#define CAN_CALL_ANYTHING_NAME "com.example.CanCallAny"
+#define CAN_CALL_SOME_NAME "com.example.CanCallSome"
+#define CAN_RECEIVE_ANYTHING_NAME "com.example.CanReceiveAny"
+#define CAN_RECEIVE_SOME_NAME "com.example.CanReceiveSome"
+
+#define EXAMPLE_IFACE "net.example.AnyInterface"
+#define EXAMPLE_METHOD "Echo"
+#define EXAMPLE_SIGNAL "Shouted"
+#define EXAMPLE_PATH "/path"
+#define CAN_CALL_SOME_IFACE "org.example.CanCallThis"
+#define CAN_CALL_SOME_METHOD "OnlyThisMethod"
+#define CAN_CALL_SOME_PATH "/only/this/path"
+#define CAN_RECEIVE_SOME_IFACE "org.example.CanReceiveThis"
+#define CAN_RECEIVE_SOME_SIGNAL "JustThisSignal"
+#define CAN_RECEIVE_SOME_PATH "/just/this/path"
+
 typedef struct
 {
   GDBusConnection *conn;
@@ -60,6 +85,14 @@ connection_clear (Connection *self)
 typedef struct
 {
   Connection proxied;
+  Connection cannot_access_conn;
+  Connection can_see_conn;
+  Connection can_talk_conn;
+  Connection can_own_conn;
+  Connection can_call_anything_conn;
+  Connection can_call_some_conn;
+  Connection can_receive_anything_conn;
+  Connection can_receive_some_conn;
   GSubprocess *dbus_daemon;
   GSubprocess *monitor;
   GSubprocess *proxy;
@@ -75,6 +108,55 @@ typedef struct
 {
   int dummy;
 } Config;
+
+/*
+ * Open a direct connection to the bus
+ */
+static void
+fixture_connect (Fixture *f,
+                 Connection *conn,
+                 const char *name)
+{
+  g_autoptr(GError) error = NULL;
+
+  g_return_if_fail (conn != NULL);
+  g_return_if_fail (conn->conn == NULL);
+  conn->conn = g_dbus_connection_new_for_address_sync (f->dbus_address,
+                                                       (G_DBUS_CONNECTION_FLAGS_AUTHENTICATION_CLIENT
+                                                        | G_DBUS_CONNECTION_FLAGS_MESSAGE_BUS_CONNECTION),
+                                                       NULL,    /* observer */
+                                                       NULL,    /* cancellable */
+                                                       &error);
+  g_assert_no_error (error);
+  g_assert_nonnull (conn->conn);
+  conn->unique_name = g_dbus_connection_get_unique_name (conn->conn);
+
+  if (name != NULL)
+    {
+      g_autoptr(GVariant) tuple = NULL;
+      guint32 result = 0;
+
+      tuple = g_dbus_connection_call_sync (conn->conn,
+                                           DBUS_SERVICE_DBUS,
+                                           DBUS_PATH_DBUS,
+                                           DBUS_INTERFACE_DBUS,
+                                           "RequestName",
+                                           g_variant_new ("(su)",
+                                                           name,
+                                                           (G_BUS_NAME_OWNER_FLAGS_ALLOW_REPLACEMENT
+                                                           | G_BUS_NAME_OWNER_FLAGS_REPLACE
+                                                           | G_BUS_NAME_OWNER_FLAGS_DO_NOT_QUEUE)),
+                                           G_VARIANT_TYPE ("(u)"),
+                                           G_DBUS_CALL_FLAGS_NONE,
+                                           -1,
+                                           NULL,    /* cancellable */
+                                           &error);
+      g_assert_no_error (error);
+      g_assert_nonnull (tuple);
+      g_variant_get (tuple, "(u)", &result);
+      g_assert_cmpuint (result, ==, DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER);
+    }
+}
 
 static void
 setup (Fixture *f,
@@ -148,6 +230,15 @@ setup (Fixture *f,
   f->proxy_socket = g_build_filename (f->temp_directory, "proxy", NULL);
   escaped = g_dbus_address_escape_value (f->proxy_socket);
   f->proxy_address = g_strdup_printf ("unix:path=%s", escaped);
+
+  fixture_connect (f, &f->cannot_access_conn, CANNOT_ACCESS_NAME);
+  fixture_connect (f, &f->can_see_conn, CAN_SEE_NAME);
+  fixture_connect (f, &f->can_talk_conn, CAN_TALK_NAME);
+  fixture_connect (f, &f->can_own_conn, CAN_OWN_NAME);
+  fixture_connect (f, &f->can_call_anything_conn, CAN_CALL_ANYTHING_NAME);
+  fixture_connect (f, &f->can_call_some_conn, CAN_CALL_SOME_NAME);
+  fixture_connect (f, &f->can_receive_anything_conn, CAN_RECEIVE_ANYTHING_NAME);
+  fixture_connect (f, &f->can_receive_some_conn, CAN_RECEIVE_SOME_NAME);
 }
 
 enum
@@ -184,6 +275,15 @@ fixture_start_proxy (Fixture *f)
                                           "--fd=3",
                                           f->dbus_address,
                                           f->proxy_socket,
+                                          "--filter",
+                                          "--log",
+                                          "--see=" CAN_SEE_NAME,
+                                          "--talk=" CAN_TALK_NAME,
+                                          "--own=" CAN_OWN_NAME,
+                                          "--call=" CAN_CALL_ANYTHING_NAME "=*",
+                                          "--call=" CAN_CALL_SOME_NAME "=" CAN_CALL_SOME_IFACE "." CAN_CALL_SOME_METHOD "@" CAN_CALL_SOME_PATH,
+                                          "--broadcast=" CAN_RECEIVE_ANYTHING_NAME "=*",
+                                          "--broadcast=" CAN_RECEIVE_SOME_NAME "=" CAN_RECEIVE_SOME_IFACE "." CAN_RECEIVE_SOME_SIGNAL "@" CAN_RECEIVE_SOME_PATH,
                                           NULL);
   g_assert_no_error (error);
   g_assert_nonnull (f->proxy);
