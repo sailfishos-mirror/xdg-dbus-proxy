@@ -341,6 +341,109 @@ test_basics (Fixture *f,
   g_assert_true (found);
 }
 
+typedef struct
+{
+  const char *name;
+  gboolean can_own;
+  gboolean can_see;
+} OwnTest;
+
+static const OwnTest own_tests[] =
+{
+  { CANNOT_ACCESS_NAME, .can_own = FALSE, .can_see = FALSE },
+  { CAN_SEE_NAME, .can_own = FALSE, .can_see = TRUE },
+  { CAN_TALK_NAME, .can_own = FALSE, .can_see = TRUE },
+  { CAN_OWN_NAME, .can_own = TRUE, .can_see = TRUE },
+  { CAN_CALL_ANYTHING_NAME, .can_own = FALSE, .can_see = TRUE },
+  { CAN_CALL_SOME_NAME, .can_own = FALSE, .can_see = TRUE },
+  { CAN_RECEIVE_ANYTHING_NAME, .can_own = FALSE, .can_see = TRUE },
+  { CAN_RECEIVE_SOME_NAME, .can_own = FALSE, .can_see = TRUE },
+};
+
+static void
+test_own (Fixture *f,
+          gconstpointer context G_GNUC_UNUSED)
+{
+  alarm (30);
+  fixture_start_proxy (f);
+
+  for (size_t i = 0; i < G_N_ELEMENTS (own_tests); i++)
+    {
+      const OwnTest *t = &own_tests[i];
+      g_autoptr(GError) error = NULL;
+      g_autoptr(GVariant) tuple = NULL;
+      const char *owner = NULL;
+
+      g_test_message ("#%zu: sandboxed connection %s be allowed to own %s",
+                      i, t->can_own ? "should" : "should not", t->name);
+
+      tuple = g_dbus_connection_call_sync (f->proxied.conn,
+                                           DBUS_SERVICE_DBUS,
+                                           DBUS_PATH_DBUS,
+                                           DBUS_INTERFACE_DBUS,
+                                           "RequestName",
+                                           g_variant_new ("(su)",
+                                                           t->name,
+                                                           (G_BUS_NAME_OWNER_FLAGS_ALLOW_REPLACEMENT
+                                                           | G_BUS_NAME_OWNER_FLAGS_REPLACE
+                                                           | G_BUS_NAME_OWNER_FLAGS_DO_NOT_QUEUE)),
+                                           G_VARIANT_TYPE ("(u)"),
+                                           G_DBUS_CALL_FLAGS_NONE,
+                                           -1,
+                                           NULL,    /* cancellable */
+                                           &error);
+
+      if (tuple != NULL)
+        g_test_message ("-> Was allowed");
+      else
+        g_test_message ("-> Was not allowed: %s", error->message);
+
+      if (t->can_own)
+        {
+          guint32 result = 0;
+
+          g_assert_no_error (error);
+          g_assert_nonnull (tuple);
+          g_variant_get (tuple, "(u)", &result);
+          g_assert_cmpuint (result, ==, DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER);
+        }
+      else if (t->can_see)
+        {
+          g_assert_error (error, G_DBUS_ERROR, G_DBUS_ERROR_ACCESS_DENIED);
+        }
+      else
+        {
+          g_assert_error (error, G_DBUS_ERROR, G_DBUS_ERROR_SERVICE_UNKNOWN);
+        }
+
+      g_clear_error (&error);
+      g_clear_pointer (&tuple, g_variant_unref);
+
+      /* Use a different connection to check who actually owns the name */
+      tuple = g_dbus_connection_call_sync (f->cannot_access_conn.conn,
+                                           DBUS_SERVICE_DBUS,
+                                           DBUS_PATH_DBUS,
+                                           DBUS_INTERFACE_DBUS,
+                                           "GetNameOwner",
+                                           g_variant_new ("(s)", t->name),
+                                           G_VARIANT_TYPE ("(s)"),
+                                           G_DBUS_CALL_FLAGS_NONE,
+                                           -1,
+                                           NULL,    /* cancellable */
+                                           NULL);
+
+      if (tuple != NULL)
+        g_variant_get (tuple, "(&s)", &owner);
+      else
+        owner = "";
+
+      if (t->can_own)
+        g_assert_cmpstr (owner, ==, f->proxied.unique_name);
+      else
+        g_assert_cmpstr (owner, !=, f->proxied.unique_name);
+    }
+}
+
 static void
 teardown (Fixture *f,
           gconstpointer context G_GNUC_UNUSED)
@@ -408,6 +511,7 @@ main (int argc,
   g_test_init (&argc, &argv, NULL);
 
   g_test_add ("/basics", Fixture, NULL, setup, test_basics, teardown);
+  g_test_add ("/own", Fixture, NULL, setup, test_own, teardown);
 
   return g_test_run ();
 }
