@@ -1,3 +1,12 @@
+Changes in 0.1.8
+================
+
+Released 2026-08-11
+
+  * Fix broadcast messages bypassing path/interface/member checks
+  * Improvements to the existing testing infrastructure
+  * Add tests for owning names, issuing method calls, receiving messages
+
 Changes in 0.1.7
 ================
 
